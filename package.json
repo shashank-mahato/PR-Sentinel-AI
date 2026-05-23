@@ -1,0 +1,45 @@
+{
+  "name": "pr-sentinel-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI code reviews before bugs reach production.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@octokit/app": "^16.1.2",
+    "@octokit/rest": "^22.0.1",
+    "@octokit/webhooks": "^14.0.2",
+    "@supabase/ssr": "^0.8.0",
+    "@supabase/supabase-js": "^2.87.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "lucide-react": "^0.555.0",
+    "next": "16.2.6",
+    "octokit": "^5.0.5",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "recharts": "^3.5.1",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.3.1",
+    "@tailwindcss/postcss": "^4.1.17",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.39.1",
+    "eslint-config-next": "16.2.6",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.9.3"
+  }
+}
