@@ -21,7 +21,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
 
     const { data: settings } = await admin.from("user_settings").select("*").eq("user_id", user.id).maybeSingle();
     const octokit = await getInstallationOctokit(review.repositories.installation_id);
-    const pr = await octokit.pulls.get({
+    const pr = await octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
       owner: review.repositories.owner,
       repo: review.repositories.name,
       pull_number: review.pr_number

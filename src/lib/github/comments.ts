@@ -1,9 +1,18 @@
 import "server-only";
-import type { Octokit } from "@octokit/rest";
 import type { FindingRow, UserSettingsRow } from "@/types/database";
 import { getPublicAppUrl } from "@/lib/utils/constants";
+import { safeErrorMessage } from "@/lib/utils/errors";
 import { countSeverities, getRiskLevel } from "@/lib/utils/scoring";
 import { severityRank } from "@/lib/utils/formatting";
+
+interface GitHubCommentClient {
+  request: (
+    route:
+      | "POST /repos/{owner}/{repo}/issues/{issue_number}/comments"
+      | "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments",
+    parameters: Record<string, unknown>
+  ) => Promise<{ data: unknown }>;
+}
 
 interface PostReviewCommentsInput {
   owner: string;
@@ -82,17 +91,72 @@ ${finding.why_it_matters || ""}
 ${finding.suggested_fix || ""}${code}`;
 }
 
-export async function postReviewComments(octokit: Octokit, input: PostReviewCommentsInput) {
+function getCommentId(response: { data: unknown }) {
+  if (typeof response.data === "object" && response.data && "id" in response.data) {
+    const id = (response.data as { id?: unknown }).id;
+    return typeof id === "number" ? id : null;
+  }
+  return null;
+}
+
+async function createIssueComment(
+  octokit: GitHubCommentClient,
+  input: { owner: string; repo: string; issueNumber: number; body: string }
+) {
+  const response = await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
+    owner: input.owner,
+    repo: input.repo,
+    issue_number: input.issueNumber,
+    body: input.body
+  });
+
+  return getCommentId(response);
+}
+
+async function createPullRequestReviewComment(
+  octokit: GitHubCommentClient,
+  input: {
+    owner: string;
+    repo: string;
+    pullNumber: number;
+    body: string;
+    commitId: string;
+    path: string;
+    line: number;
+  }
+) {
+  const response = await octokit.request("POST /repos/{owner}/{repo}/pulls/{pull_number}/comments", {
+    owner: input.owner,
+    repo: input.repo,
+    pull_number: input.pullNumber,
+    body: input.body,
+    commit_id: input.commitId,
+    path: input.path,
+    line: input.line,
+    side: "RIGHT"
+  });
+
+  return getCommentId(response);
+}
+
+export async function postReviewComments(octokit: GitHubCommentClient, input: PostReviewCommentsInput) {
   const inlineComments: Array<{ findingId: string; commentId: number }> = [];
   const failedInline: FindingRow[] = [];
+  const commentFailures: string[] = [];
+  let summaryCommentPosted = false;
 
   if (input.settings.post_summary_comment !== false) {
-    await octokit.issues.createComment({
-      owner: input.owner,
-      repo: input.repo,
-      issue_number: input.pullNumber,
-      body: buildSummaryComment(input)
-    });
+    try {
+      await createIssueComment(octokit, {
+        owner: input.owner,
+        repo: input.repo,
+        issueNumber: input.pullNumber,
+        body: buildSummaryComment(input)
+      });
+      summaryCommentPosted = true;
+    } catch (error) {
+      commentFailures.push(`Summary comment failed: ${safeErrorMessage(error, "GitHub rejected the summary comment.")}`);
+    }
   }
 
   if (input.settings.post_inline_comments !== false) {
@@ -106,19 +170,28 @@ export async function postReviewComments(octokit: Octokit, input: PostReviewComm
 
     for (const finding of candidates) {
       try {
-        const response = await octokit.pulls.createReviewComment({
+        const commentId = await createPullRequestReviewComment(octokit, {
           owner: input.owner,
           repo: input.repo,
-          pull_number: input.pullNumber,
-          commit_id: input.commitSha,
+          pullNumber: input.pullNumber,
+          commitId: input.commitSha,
           path: finding.file_path || "",
           line: finding.line_number || 1,
-          side: "RIGHT",
           body: buildInlineBody(finding)
         });
-        inlineComments.push({ findingId: finding.id, commentId: response.data.id });
-      } catch {
+        if (commentId) {
+          inlineComments.push({ findingId: finding.id, commentId });
+        } else {
+          failedInline.push(finding);
+          commentFailures.push(`Inline comment returned no comment id for finding ${finding.id}.`);
+        }
+      } catch (error) {
         failedInline.push(finding);
+        commentFailures.push(
+          `Inline comment failed for ${finding.file_path || "unknown file"}${
+            finding.line_number ? `:${finding.line_number}` : ""
+          }: ${safeErrorMessage(error, "GitHub rejected the inline comment.")}`
+        );
       }
     }
   }
@@ -131,19 +204,28 @@ export async function postReviewComments(octokit: Octokit, input: PostReviewComm
       )
       .join("\n");
 
-    await octokit.issues.createComment({
-      owner: input.owner,
-      repo: input.repo,
-      issue_number: input.pullNumber,
-      body: `## PR Sentinel AI Inline Comment Fallback
+    try {
+      await createIssueComment(octokit, {
+        owner: input.owner,
+        repo: input.repo,
+        issueNumber: input.pullNumber,
+        body: `## PR Sentinel AI Inline Comment Fallback
 
 GitHub rejected one or more inline comments, so PR Sentinel AI is grouping them here:
 
 ${fallback}
 
 Full report: ${fullReportUrl(input.reviewId)}`
-    });
+      });
+    } catch (error) {
+      commentFailures.push(`Inline fallback comment failed: ${safeErrorMessage(error, "GitHub rejected the fallback comment.")}`);
+    }
   }
 
-  return { inlineComments, failedInlineCount: failedInline.length };
+  return {
+    inlineComments,
+    failedInlineCount: failedInline.length,
+    summaryCommentPosted,
+    commentFailures
+  };
 }

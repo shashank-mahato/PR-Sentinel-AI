@@ -256,28 +256,6 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
 
     if (findingsError) throw findingsError;
 
-    const commentResult = await postReviewComments(octokit, {
-      owner: parsed.repository.owner.login,
-      repo: parsed.repository.name,
-      pullNumber: parsed.pull_request.number,
-      commitSha: parsed.pull_request.head.sha,
-      reviewId: review.id,
-      reviewUrl: review.pr_url,
-      summary: aiReview.summary,
-      riskScore: aiReview.riskScore,
-      shouldBlockMerge: aiReview.shouldBlockMerge,
-      findings: insertedFindings || [],
-      largeDiffLimited: prepared.largeDiffLimited,
-      settings
-    });
-
-    for (const comment of commentResult.inlineComments) {
-      await supabase
-        .from("review_findings")
-        .update({ github_comment_id: comment.commentId, comment_posted: true })
-        .eq("id", comment.findingId);
-    }
-
     const completedAt = new Date().toISOString();
     const { error: reviewError } = await supabase
       .from("pull_request_reviews")
@@ -295,6 +273,57 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
     if (reviewError) throw reviewError;
 
     await supabase.from("repositories").update({ last_reviewed_at: completedAt }).eq("id", repository.id);
+
+    try {
+      const commentResult = await postReviewComments(octokit, {
+        owner: parsed.repository.owner.login,
+        repo: parsed.repository.name,
+        pullNumber: parsed.pull_request.number,
+        commitSha: parsed.pull_request.head.sha,
+        reviewId: review.id,
+        reviewUrl: review.pr_url,
+        summary: aiReview.summary,
+        riskScore: aiReview.riskScore,
+        shouldBlockMerge: aiReview.shouldBlockMerge,
+        findings: insertedFindings || [],
+        largeDiffLimited: prepared.largeDiffLimited,
+        settings
+      });
+
+      for (const comment of commentResult.inlineComments) {
+        const { error: commentUpdateError } = await supabase
+          .from("review_findings")
+          .update({ github_comment_id: comment.commentId, comment_posted: true })
+          .eq("id", comment.findingId);
+
+        if (commentUpdateError) {
+          commentResult.commentFailures.push(
+            `Stored GitHub comment but failed to mark finding ${comment.findingId} as posted.`
+          );
+        }
+      }
+
+      if (commentResult.commentFailures.length > 0) {
+        await supabase
+          .from("pull_request_reviews")
+          .update({
+            error_message: `Review completed, but GitHub comment posting had warnings: ${commentResult.commentFailures
+              .slice(0, 5)
+              .join(" | ")}`
+          })
+          .eq("id", review.id);
+      }
+    } catch (error) {
+      await supabase
+        .from("pull_request_reviews")
+        .update({
+          error_message: `Review completed, but GitHub comment posting failed: ${safeErrorMessage(
+            error,
+            "GitHub comment posting failed."
+          )}`
+        })
+        .eq("id", review.id);
+    }
 
     return { ignored: false, reviewId: review.id };
   } catch (error) {
