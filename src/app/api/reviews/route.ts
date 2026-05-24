@@ -20,7 +20,7 @@ export async function GET(request: Request) {
 
     let query = supabase
       .from("pull_request_reviews")
-      .select("*, repositories(*), review_findings(*)")
+      .select("*")
       .eq("user_id", user.id)
       .order("created_at", { ascending: false });
 

@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getInstallationOctokit } from "@/lib/github/octokit";
+import { upsertLinkedRepository } from "@/lib/github/repository-linking";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthenticatedUser } from "@/lib/supabase/server";
 import { AppError, jsonError } from "@/lib/utils/errors";
@@ -63,35 +64,17 @@ async function persistInstallation(installationId: number) {
   if (installationError) throw installationError;
 
   for (const repository of repositories) {
-    const values = {
-      user_id: user.id,
-      github_repo_id: repository.id,
+    await upsertLinkedRepository(admin, {
+      userId: user.id,
+      githubRepoId: repository.id,
       owner: repository.owner?.login || repository.full_name.split("/")[0],
       name: repository.name,
-      full_name: repository.full_name,
+      fullName: repository.full_name,
       private: repository.private,
-      default_branch: repository.default_branch || null,
-      installation_id: installationId,
-      html_url: repository.html_url || null,
-      is_active: true
-    };
-
-    const { data: existing, error: existingError } = await admin
-      .from("repositories")
-      .select("id")
-      .eq("installation_id", installationId)
-      .eq("github_repo_id", repository.id)
-      .limit(1);
-
-    if (existingError) throw existingError;
-
-    if (existing?.[0]) {
-      const { error } = await admin.from("repositories").update(values).eq("id", existing[0].id);
-      if (error) throw error;
-    } else {
-      const { error } = await admin.from("repositories").insert(values);
-      if (error) throw error;
-    }
+      defaultBranch: repository.default_branch || null,
+      installationId,
+      htmlUrl: repository.html_url || null
+    });
   }
 
   await admin.from("user_settings").upsert({ user_id: user.id }, { onConflict: "user_id" });

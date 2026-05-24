@@ -10,6 +10,7 @@ import type { PullRequestWebhookPayload } from "@/types/github";
 import { fetchAndPreparePullRequestFiles } from "./diff";
 import { getInstallationOctokit } from "./octokit";
 import { postReviewComments } from "./comments";
+import { resolveUserIdForInstallationRepository, upsertLinkedRepository } from "./repository-linking";
 
 const PullRequestPayloadSchema = z.object({
   action: z.string(),
@@ -77,45 +78,6 @@ export function verifyGitHubSignature(rawBody: string, signatureHeader: string |
   return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
-async function resolveInstallationUserId(
-  supabase: SupabaseAdmin,
-  installationId: number,
-  githubRepoId: number,
-  repositoryFullName: string
-) {
-  const { data: installation } = await supabase
-    .from("github_installations")
-    .select("user_id")
-    .eq("installation_id", installationId)
-    .maybeSingle();
-
-  if (installation?.user_id) return installation.user_id;
-
-  const { data: repositoryById } = await supabase
-    .from("repositories")
-    .select("user_id")
-    .eq("installation_id", installationId)
-    .eq("github_repo_id", githubRepoId)
-    .not("user_id", "is", null)
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (repositoryById?.user_id) return repositoryById.user_id;
-
-  const { data: repositoryByName } = await supabase
-    .from("repositories")
-    .select("user_id")
-    .eq("installation_id", installationId)
-    .eq("full_name", repositoryFullName)
-    .not("user_id", "is", null)
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  return repositoryByName?.user_id || null;
-}
-
 async function getSettings(supabase: SupabaseAdmin, userId: string | null): Promise<UserSettingsRow> {
   const defaults: UserSettingsRow = {
     id: "defaults",
@@ -134,49 +96,6 @@ async function getSettings(supabase: SupabaseAdmin, userId: string | null): Prom
 
   const { data, error } = await supabase.from("user_settings").select("*").eq("user_id", userId).maybeSingle();
   if (error || !data) return defaults;
-  return data;
-}
-
-async function upsertRepository(
-  supabase: SupabaseAdmin,
-  payload: PullRequestWebhookPayload,
-  installationId: number,
-  userId: string | null
-) {
-  const repository = payload.repository;
-  if (!repository) throw new Error("Missing repository payload.");
-
-  const { data: existingRows } = await supabase
-    .from("repositories")
-    .select("*")
-    .eq("installation_id", installationId)
-    .eq("github_repo_id", repository.id);
-
-  const existing =
-    existingRows?.find((row) => row.user_id === userId) ||
-    existingRows?.find((row) => row.user_id) ||
-    existingRows?.[0];
-  const values: Database["public"]["Tables"]["repositories"]["Insert"] = {
-    user_id: userId,
-    github_repo_id: repository.id,
-    owner: repository.owner.login,
-    name: repository.name,
-    full_name: repository.full_name,
-    private: repository.private,
-    default_branch: repository.default_branch || null,
-    installation_id: installationId,
-    html_url: repository.html_url,
-    is_active: true
-  };
-
-  if (existing) {
-    const { data, error } = await supabase.from("repositories").update(values).eq("id", existing.id).select().single();
-    if (error) throw error;
-    return data;
-  }
-
-  const { data, error } = await supabase.from("repositories").insert(values).select().single();
-  if (error) throw error;
   return data;
 }
 
@@ -240,7 +159,24 @@ export async function queuePullRequestReview(
   if (!installationId) throw new Error("Missing installation ID.");
 
   const supabase = createSupabaseAdminClient();
-  const userId = await resolveInstallationUserId(supabase, installationId, parsed.repository.id, parsed.repository.full_name);
+  const resolvedUserId = await resolveUserIdForInstallationRepository(
+    supabase,
+    installationId,
+    parsed.repository.id,
+    parsed.repository.full_name
+  );
+  const { repository, userId } = await upsertLinkedRepository(supabase, {
+    userId: resolvedUserId,
+    installationId,
+    githubRepoId: parsed.repository.id,
+    owner: parsed.repository.owner.login,
+    name: parsed.repository.name,
+    fullName: parsed.repository.full_name,
+    private: parsed.repository.private,
+    defaultBranch: parsed.repository.default_branch || null,
+    htmlUrl: parsed.repository.html_url
+  });
+
   const userLinkWarning = userId
     ? null
     : "GitHub installation is not linked to a Supabase user; dashboard visibility may be limited.";
@@ -250,7 +186,6 @@ export async function queuePullRequestReview(
     return { ignored: true, reason: "Draft pull request reviews are disabled." };
   }
 
-  const repository = await upsertRepository(supabase, parsed, installationId, userId);
   if (repository.is_active === false) {
     return { ignored: true, reason: "Repository is inactive." };
   }
