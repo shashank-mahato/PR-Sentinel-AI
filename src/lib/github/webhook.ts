@@ -37,6 +37,24 @@ const PullRequestPayloadSchema = z.object({
 });
 
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdminClient>;
+type ParsedPullRequestPayload = z.infer<typeof PullRequestPayloadSchema>;
+
+interface PullRequestReviewJob {
+  payload: ParsedPullRequestPayload;
+  reviewId: string;
+  repositoryId: string;
+  installationId: number;
+  settings: UserSettingsRow;
+}
+
+interface QueuePullRequestReviewResult {
+  ignored: boolean;
+  reason?: string;
+  reviewId?: string;
+  job?: PullRequestReviewJob;
+}
+
+type ScheduleReviewJob = (job: PullRequestReviewJob) => void;
 
 export function verifyGitHubSignature(rawBody: string, signatureHeader: string | null) {
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
@@ -164,7 +182,7 @@ async function upsertRepository(
 
 async function createOrUpdateReview(
   supabase: SupabaseAdmin,
-  payload: PullRequestWebhookPayload,
+  payload: ParsedPullRequestPayload,
   repositoryId: string,
   userId: string | null,
   userLinkWarning: string | null,
@@ -184,7 +202,7 @@ async function createOrUpdateReview(
     pr_url: pr.html_url,
     base_branch: pr.base.ref,
     head_branch: pr.head.ref,
-    status: "analyzing",
+    status: "pending",
     risk_score: 0,
     should_block_merge: false,
     summary: null,
@@ -213,7 +231,10 @@ async function createOrUpdateReview(
   return data;
 }
 
-export async function processPullRequestPayload(payload: PullRequestWebhookPayload, existingReviewId?: string) {
+export async function queuePullRequestReview(
+  payload: PullRequestWebhookPayload,
+  existingReviewId?: string
+): Promise<QueuePullRequestReviewResult> {
   const parsed = PullRequestPayloadSchema.parse(payload);
   const installationId = parsed.installation?.id;
   if (!installationId) throw new Error("Missing installation ID.");
@@ -236,8 +257,32 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
 
   const review = await createOrUpdateReview(supabase, parsed, repository.id, userId, userLinkWarning, existingReviewId);
 
+  return {
+    ignored: false,
+    reviewId: review.id,
+    job: {
+      payload: parsed,
+      reviewId: review.id,
+      repositoryId: repository.id,
+      installationId,
+      settings
+    }
+  };
+}
+
+export async function processPullRequestReviewInBackground(job: PullRequestReviewJob) {
+  const parsed = job.payload;
+  const supabase = createSupabaseAdminClient();
+
   try {
-    const octokit = await getInstallationOctokit(installationId);
+    await supabase
+      .from("pull_request_reviews")
+      .update({
+        status: "analyzing"
+      })
+      .eq("id", job.reviewId);
+
+    const octokit = await getInstallationOctokit(job.installationId);
     const prepared = await fetchAndPreparePullRequestFiles(octokit, {
       owner: parsed.repository.owner.login,
       repo: parsed.repository.name,
@@ -257,14 +302,14 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
         files: prepared.files,
         largeDiffLimited: prepared.largeDiffLimited
       },
-      settings.block_merge_threshold || 70
+      job.settings.block_merge_threshold || 70
     );
 
     const { data: insertedFindings, error: findingsError } = await supabase
       .from("review_findings")
       .insert(
         aiReview.findings.map((finding) => ({
-          review_id: review.id,
+          review_id: job.reviewId,
           severity: finding.severity,
           category: finding.category,
           title: finding.title,
@@ -292,11 +337,11 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
         files_analyzed: prepared.files.length,
         completed_at: completedAt
       })
-      .eq("id", review.id);
+      .eq("id", job.reviewId);
 
     if (reviewError) throw reviewError;
 
-    await supabase.from("repositories").update({ last_reviewed_at: completedAt }).eq("id", repository.id);
+    await supabase.from("repositories").update({ last_reviewed_at: completedAt }).eq("id", job.repositoryId);
 
     try {
       const commentResult = await postReviewComments(octokit, {
@@ -304,14 +349,14 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
         repo: parsed.repository.name,
         pullNumber: parsed.pull_request.number,
         commitSha: parsed.pull_request.head.sha,
-        reviewId: review.id,
-        reviewUrl: review.pr_url,
+        reviewId: job.reviewId,
+        reviewUrl: parsed.pull_request.html_url,
         summary: aiReview.summary,
         riskScore: aiReview.riskScore,
         shouldBlockMerge: aiReview.shouldBlockMerge,
         findings: insertedFindings || [],
         largeDiffLimited: prepared.largeDiffLimited,
-        settings
+        settings: job.settings
       });
 
       for (const comment of commentResult.inlineComments) {
@@ -335,7 +380,7 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
               .slice(0, 5)
               .join(" | ")}`
           })
-          .eq("id", review.id);
+          .eq("id", job.reviewId);
       }
     } catch (error) {
       await supabase
@@ -346,10 +391,8 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
             "GitHub comment posting failed."
           )}`
         })
-        .eq("id", review.id);
+        .eq("id", job.reviewId);
     }
-
-    return { ignored: false, reviewId: review.id };
   } catch (error) {
     const message = safeErrorMessage(error, "Review processing failed.");
     await supabase
@@ -359,12 +402,22 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
         error_message: message,
         completed_at: new Date().toISOString()
       })
-      .eq("id", review.id);
+      .eq("id", job.reviewId);
     throw error;
   }
 }
 
-export async function handleGitHubWebhook(rawBody: string, headers: Headers) {
+export async function processPullRequestPayload(payload: PullRequestWebhookPayload, existingReviewId?: string) {
+  const queued = await queuePullRequestReview(payload, existingReviewId);
+  if (queued.ignored || !queued.job) {
+    return { ignored: true, reason: queued.reason };
+  }
+
+  await processPullRequestReviewInBackground(queued.job);
+  return { ignored: false, reviewId: queued.reviewId };
+}
+
+export async function handleGitHubWebhook(rawBody: string, headers: Headers, scheduleReviewJob?: ScheduleReviewJob) {
   const signature = headers.get("x-hub-signature-256");
   const deliveryId = headers.get("x-github-delivery");
   const eventType = headers.get("x-github-event");
@@ -404,9 +457,24 @@ export async function handleGitHubWebhook(rawBody: string, headers: Headers) {
   }
 
   try {
-    const result = await processPullRequestPayload(payload);
+    const result = await queuePullRequestReview(payload);
     await supabase.from("webhook_events").update({ processed: true }).eq("github_delivery_id", deliveryId);
-    return Response.json({ status: "ok", ...result });
+
+    if (result.ignored || !result.job) {
+      return Response.json({ status: "ignored", reason: result.reason });
+    }
+
+    if (scheduleReviewJob) {
+      scheduleReviewJob(result.job);
+    } else {
+      await processPullRequestReviewInBackground(result.job);
+    }
+
+    return Response.json({
+      status: "accepted",
+      reviewId: result.reviewId,
+      message: "Review queued"
+    });
   } catch (error) {
     const message = safeErrorMessage(error, "Webhook processing failed.");
     await supabase
