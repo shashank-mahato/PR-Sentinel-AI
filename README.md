@@ -61,7 +61,7 @@ GITHUB_CLIENT_ID=your_github_oauth_client_id
 GITHUB_CLIENT_SECRET=your_github_oauth_client_secret
 
 GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 
 REVIEW_MAX_TOTAL_DIFF_CHARS=60000
 REVIEW_MAX_FILES=20
