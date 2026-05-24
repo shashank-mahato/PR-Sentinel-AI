@@ -37,7 +37,7 @@ export async function fetchAndPreparePullRequestFiles(
   octokit: Octokit,
   input: { owner: string; repo: string; pullNumber: number }
 ) {
-  const files = await octokit.paginate(octokit.pulls.listFiles, {
+  const files = await octokit.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/files", {
     owner: input.owner,
     repo: input.repo,
     pull_number: input.pullNumber,
