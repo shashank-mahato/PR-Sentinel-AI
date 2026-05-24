@@ -1,6 +1,9 @@
 import "server-only";
-import { Octokit } from "@octokit/rest";
 import { createGitHubApp } from "./app";
+
+export interface GitHubInstallationClient {
+  request: (route: string, parameters?: Record<string, unknown>) => Promise<{ data: unknown }>;
+}
 
 export async function getInstallationOctokit(installationId: number) {
   if (!installationId) {
@@ -9,5 +12,5 @@ export async function getInstallationOctokit(installationId: number) {
 
   const app = createGitHubApp();
   const octokit = await app.getInstallationOctokit(installationId);
-  return octokit as unknown as Octokit;
+  return octokit as unknown as GitHubInstallationClient;
 }

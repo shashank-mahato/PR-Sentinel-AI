@@ -8,6 +8,10 @@ import { loadReviewWithRelations } from "@/lib/reviews/data";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+interface GitHubPullRequestDetails {
+  head: { sha: string };
+}
+
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await context.params;
@@ -26,12 +30,13 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
       repo: review.repositories.name,
       pull_number: review.pr_number
     });
+    const prData = pr.data as GitHubPullRequestDetails;
 
     const result = await postReviewComments(octokit, {
       owner: review.repositories.owner,
       repo: review.repositories.name,
       pullNumber: review.pr_number,
-      commitSha: pr.data.head.sha,
+      commitSha: prData.head.sha,
       reviewId: review.id,
       reviewUrl: review.pr_url,
       summary: review.summary || "PR Sentinel AI completed the review.",

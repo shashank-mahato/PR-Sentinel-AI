@@ -79,6 +79,30 @@ export interface Database {
         Update: Partial<Database["public"]["Tables"]["repositories"]["Insert"]>;
         Relationships: [];
       };
+      github_installations: {
+        Row: {
+          id: string;
+          user_id: string;
+          installation_id: number;
+          account_login: string | null;
+          account_type: string | null;
+          html_url: string | null;
+          created_at: string | null;
+          updated_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          user_id: string;
+          installation_id: number;
+          account_login?: string | null;
+          account_type?: string | null;
+          html_url?: string | null;
+          created_at?: string | null;
+          updated_at?: string | null;
+        };
+        Update: Partial<Database["public"]["Tables"]["github_installations"]["Insert"]>;
+        Relationships: [];
+      };
       pull_request_reviews: {
         Row: {
           id: string;
@@ -235,3 +259,4 @@ export type RepositoryRow = Database["public"]["Tables"]["repositories"]["Row"];
 export type ReviewRow = Database["public"]["Tables"]["pull_request_reviews"]["Row"];
 export type FindingRow = Database["public"]["Tables"]["review_findings"]["Row"];
 export type UserSettingsRow = Database["public"]["Tables"]["user_settings"]["Row"];
+export type GitHubInstallationRow = Database["public"]["Tables"]["github_installations"]["Row"];

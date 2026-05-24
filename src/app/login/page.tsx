@@ -16,10 +16,17 @@ export default function LoginPage() {
     setError(null);
 
     const supabase = createSupabaseBrowserClient();
+    const params = new URLSearchParams(window.location.search);
+    const next = params.get("next");
+    const callbackUrl = new URL("/auth/callback", process.env.NEXT_PUBLIC_APP_URL || window.location.origin);
+    if (next?.startsWith("/")) {
+      callbackUrl.searchParams.set("next", next);
+    }
+
     const { error: signInError } = await supabase.auth.signInWithOAuth({
       provider: "github",
       options: {
-        redirectTo: `${process.env.NEXT_PUBLIC_APP_URL || window.location.origin}/auth/callback`
+        redirectTo: callbackUrl.toString()
       }
     });
 

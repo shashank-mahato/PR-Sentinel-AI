@@ -93,6 +93,7 @@ Open `http://localhost:3000` only for local UI checks.
 4. Apply migrations from `supabase/migrations/` in order:
    - `001_initial_schema.sql`
    - `002_rls_policies.sql`
+   - `003_github_installations.sql`
 5. Confirm Row Level Security is enabled on:
    - `profiles`
    - `repositories`
@@ -124,10 +125,10 @@ Create a GitHub App for production.
 
 Settings:
 
-- Homepage URL: `https://your-vercel-domain.vercel.app`
-- Webhook URL: `https://your-vercel-domain.vercel.app/api/github/webhook`
-- Setup URL: `https://your-vercel-domain.vercel.app/api/github/install`
-- Callback URL if OAuth is used: `https://your-vercel-domain.vercel.app/auth/callback`
+- Homepage URL: `https://pr-sentinel-ai.vercel.app`
+- Webhook URL: `https://pr-sentinel-ai.vercel.app/api/github/webhook`
+- Setup URL: `https://pr-sentinel-ai.vercel.app/api/github/install`
+- Callback URL if OAuth is used: `https://pr-sentinel-ai.vercel.app/auth/callback`
 - Webhook secret: the same value as `GITHUB_WEBHOOK_SECRET` in Vercel
 
 Permissions:
@@ -156,7 +157,7 @@ GITHUB_CLIENT_ID=your_github_oauth_client_id
 GITHUB_CLIENT_SECRET=your_github_oauth_client_secret
 ```
 
-Install the GitHub App on a real repository. When the install callback reaches `/api/github/install?installation_id=...`, PR Sentinel AI persists the real repositories for the signed-in Supabase user.
+Sign in to PR Sentinel AI before clicking **Install GitHub App**. GitHub redirects back to `/api/github/install?installation_id=...`, where PR Sentinel AI links that `installation_id` to the logged-in Supabase user in `github_installations` and upserts the accessible repositories with the same `user_id`. Dashboard visibility depends on this mapping, so the install callback must complete successfully.
 
 ## Gemini Setup
 
@@ -189,7 +190,7 @@ https://your-vercel-domain.vercel.app
 9. Update the GitHub App webhook URL to:
 
 ```text
-https://your-vercel-domain.vercel.app/api/github/webhook
+https://pr-sentinel-ai.vercel.app/api/github/webhook
 ```
 
 10. Update the Supabase Auth site URL to:
@@ -215,7 +216,7 @@ https://your-vercel-domain.vercel.app/auth/callback
 Use this URL in the GitHub App:
 
 ```text
-https://your-vercel-domain.vercel.app/api/github/webhook
+https://pr-sentinel-ai.vercel.app/api/github/webhook
 ```
 
 The webhook route:
@@ -256,7 +257,7 @@ This sample is only for testing a real pull request. It is not used as applicati
 ## Troubleshooting
 
 - Invalid webhook signature: confirm `GITHUB_WEBHOOK_SECRET` matches the GitHub App webhook secret.
-- No repositories visible: sign in first, install the GitHub App, and make sure the install callback is configured.
+- No repositories visible: sign in first, install the GitHub App, confirm the Setup URL is `https://pr-sentinel-ai.vercel.app/api/github/install`, and make sure `github_installations.installation_id` is linked to your Supabase `auth.users.id`.
 - Gemini failures: confirm `GEMINI_API_KEY` and `GEMINI_MODEL` are set in Vercel.
 - No dashboard updates: confirm Supabase Realtime is enabled for `pull_request_reviews`, `review_findings`, and `repositories`.
 - Inline comments fail: GitHub may reject line numbers outside the current diff. PR Sentinel AI posts a grouped fallback comment.

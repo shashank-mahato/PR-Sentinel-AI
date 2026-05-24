@@ -9,6 +9,18 @@ import type { PullRequestWebhookPayload } from "@/types/github";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+interface GitHubPullRequestDetails {
+  id: number;
+  number: number;
+  title: string;
+  body: string | null;
+  html_url: string;
+  draft?: boolean;
+  user?: { login: string } | null;
+  head: { ref: string; sha: string };
+  base: { ref: string; sha: string };
+}
+
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await context.params;
@@ -27,6 +39,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
       repo: review.repositories.name,
       pull_number: review.pr_number
     });
+    const prData = pr.data as GitHubPullRequestDetails;
 
     const payload: PullRequestWebhookPayload = {
       action: "synchronize",
@@ -41,15 +54,15 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
         owner: { login: review.repositories.owner }
       },
       pull_request: {
-        id: pr.data.id,
-        number: pr.data.number,
-        title: pr.data.title,
-        body: pr.data.body,
-        html_url: pr.data.html_url,
-        draft: pr.data.draft || false,
-        user: pr.data.user ? { login: pr.data.user.login } : null,
-        head: { ref: pr.data.head.ref, sha: pr.data.head.sha },
-        base: { ref: pr.data.base.ref, sha: pr.data.base.sha }
+        id: prData.id,
+        number: prData.number,
+        title: prData.title,
+        body: prData.body,
+        html_url: prData.html_url,
+        draft: prData.draft || false,
+        user: prData.user ? { login: prData.user.login } : null,
+        head: { ref: prData.head.ref, sha: prData.head.sha },
+        base: { ref: prData.base.ref, sha: prData.base.sha }
       }
     };
 

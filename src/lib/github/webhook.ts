@@ -59,12 +59,21 @@ export function verifyGitHubSignature(rawBody: string, signatureHeader: string |
   return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
-async function findRepositoryOwner(
+async function resolveInstallationUserId(
   supabase: SupabaseAdmin,
   installationId: number,
-  githubRepoId: number
+  githubRepoId: number,
+  repositoryFullName: string
 ) {
-  const { data } = await supabase
+  const { data: installation } = await supabase
+    .from("github_installations")
+    .select("user_id")
+    .eq("installation_id", installationId)
+    .maybeSingle();
+
+  if (installation?.user_id) return installation.user_id;
+
+  const { data: repositoryById } = await supabase
     .from("repositories")
     .select("user_id")
     .eq("installation_id", installationId)
@@ -74,7 +83,19 @@ async function findRepositoryOwner(
     .limit(1)
     .maybeSingle();
 
-  return data?.user_id || null;
+  if (repositoryById?.user_id) return repositoryById.user_id;
+
+  const { data: repositoryByName } = await supabase
+    .from("repositories")
+    .select("user_id")
+    .eq("installation_id", installationId)
+    .eq("full_name", repositoryFullName)
+    .not("user_id", "is", null)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return repositoryByName?.user_id || null;
 }
 
 async function getSettings(supabase: SupabaseAdmin, userId: string | null): Promise<UserSettingsRow> {
@@ -107,17 +128,16 @@ async function upsertRepository(
   const repository = payload.repository;
   if (!repository) throw new Error("Missing repository payload.");
 
-  const existingQuery = supabase
+  const { data: existingRows } = await supabase
     .from("repositories")
     .select("*")
     .eq("installation_id", installationId)
     .eq("github_repo_id", repository.id);
 
-  const { data: existingRows } = userId
-    ? await existingQuery.eq("user_id", userId)
-    : await existingQuery.is("user_id", null);
-
-  const existing = existingRows?.[0];
+  const existing =
+    existingRows?.find((row) => row.user_id === userId) ||
+    existingRows?.find((row) => row.user_id) ||
+    existingRows?.[0];
   const values: Database["public"]["Tables"]["repositories"]["Insert"] = {
     user_id: userId,
     github_repo_id: repository.id,
@@ -147,6 +167,7 @@ async function createOrUpdateReview(
   payload: PullRequestWebhookPayload,
   repositoryId: string,
   userId: string | null,
+  userLinkWarning: string | null,
   existingReviewId?: string
 ) {
   const pr = payload.pull_request;
@@ -167,7 +188,7 @@ async function createOrUpdateReview(
     risk_score: 0,
     should_block_merge: false,
     summary: null,
-    error_message: null,
+    error_message: userLinkWarning,
     large_diff_limited: false,
     files_analyzed: 0,
     started_at: new Date().toISOString(),
@@ -198,7 +219,10 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
   if (!installationId) throw new Error("Missing installation ID.");
 
   const supabase = createSupabaseAdminClient();
-  const userId = await findRepositoryOwner(supabase, installationId, parsed.repository.id);
+  const userId = await resolveInstallationUserId(supabase, installationId, parsed.repository.id, parsed.repository.full_name);
+  const userLinkWarning = userId
+    ? null
+    : "GitHub installation is not linked to a Supabase user; dashboard visibility may be limited.";
   const settings = await getSettings(supabase, userId);
 
   if (parsed.pull_request.draft && !settings.review_draft_prs) {
@@ -210,7 +234,7 @@ export async function processPullRequestPayload(payload: PullRequestWebhookPaylo
     return { ignored: true, reason: "Repository is inactive." };
   }
 
-  const review = await createOrUpdateReview(supabase, parsed, repository.id, userId, existingReviewId);
+  const review = await createOrUpdateReview(supabase, parsed, repository.id, userId, userLinkWarning, existingReviewId);
 
   try {
     const octokit = await getInstallationOctokit(installationId);
