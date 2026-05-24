@@ -10,7 +10,6 @@ import type { PullRequestWebhookPayload } from "@/types/github";
 import { fetchAndPreparePullRequestFiles } from "./diff";
 import { getInstallationOctokit } from "./octokit";
 import { postReviewComments } from "./comments";
-import { resolveUserIdForInstallationRepository, upsertLinkedRepository } from "./repository-linking";
 
 const PullRequestPayloadSchema = z.object({
   action: z.string(),
@@ -38,24 +37,6 @@ const PullRequestPayloadSchema = z.object({
 });
 
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdminClient>;
-type ParsedPullRequestPayload = z.infer<typeof PullRequestPayloadSchema>;
-
-interface PullRequestReviewJob {
-  payload: ParsedPullRequestPayload;
-  reviewId: string;
-  repositoryId: string;
-  installationId: number;
-  settings: UserSettingsRow;
-}
-
-interface QueuePullRequestReviewResult {
-  ignored: boolean;
-  reason?: string;
-  reviewId?: string;
-  job?: PullRequestReviewJob;
-}
-
-type ScheduleReviewJob = (job: PullRequestReviewJob) => void;
 
 export function verifyGitHubSignature(rawBody: string, signatureHeader: string | null) {
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
@@ -76,6 +57,45 @@ export function verifyGitHubSignature(rawBody: string, signatureHeader: string |
   }
 
   return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+async function resolveInstallationUserId(
+  supabase: SupabaseAdmin,
+  installationId: number,
+  githubRepoId: number,
+  repositoryFullName: string
+) {
+  const { data: installation } = await supabase
+    .from("github_installations")
+    .select("user_id")
+    .eq("installation_id", installationId)
+    .maybeSingle();
+
+  if (installation?.user_id) return installation.user_id;
+
+  const { data: repositoryById } = await supabase
+    .from("repositories")
+    .select("user_id")
+    .eq("installation_id", installationId)
+    .eq("github_repo_id", githubRepoId)
+    .not("user_id", "is", null)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (repositoryById?.user_id) return repositoryById.user_id;
+
+  const { data: repositoryByName } = await supabase
+    .from("repositories")
+    .select("user_id")
+    .eq("installation_id", installationId)
+    .eq("full_name", repositoryFullName)
+    .not("user_id", "is", null)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return repositoryByName?.user_id || null;
 }
 
 async function getSettings(supabase: SupabaseAdmin, userId: string | null): Promise<UserSettingsRow> {
@@ -99,9 +119,52 @@ async function getSettings(supabase: SupabaseAdmin, userId: string | null): Prom
   return data;
 }
 
+async function upsertRepository(
+  supabase: SupabaseAdmin,
+  payload: PullRequestWebhookPayload,
+  installationId: number,
+  userId: string | null
+) {
+  const repository = payload.repository;
+  if (!repository) throw new Error("Missing repository payload.");
+
+  const { data: existingRows } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("installation_id", installationId)
+    .eq("github_repo_id", repository.id);
+
+  const existing =
+    existingRows?.find((row) => row.user_id === userId) ||
+    existingRows?.find((row) => row.user_id) ||
+    existingRows?.[0];
+  const values: Database["public"]["Tables"]["repositories"]["Insert"] = {
+    user_id: userId,
+    github_repo_id: repository.id,
+    owner: repository.owner.login,
+    name: repository.name,
+    full_name: repository.full_name,
+    private: repository.private,
+    default_branch: repository.default_branch || null,
+    installation_id: installationId,
+    html_url: repository.html_url,
+    is_active: true
+  };
+
+  if (existing) {
+    const { data, error } = await supabase.from("repositories").update(values).eq("id", existing.id).select().single();
+    if (error) throw error;
+    return data;
+  }
+
+  const { data, error } = await supabase.from("repositories").insert(values).select().single();
+  if (error) throw error;
+  return data;
+}
+
 async function createOrUpdateReview(
   supabase: SupabaseAdmin,
-  payload: ParsedPullRequestPayload,
+  payload: PullRequestWebhookPayload,
   repositoryId: string,
   userId: string | null,
   userLinkWarning: string | null,
@@ -121,7 +184,7 @@ async function createOrUpdateReview(
     pr_url: pr.html_url,
     base_branch: pr.base.ref,
     head_branch: pr.head.ref,
-    status: "pending",
+    status: "analyzing",
     risk_score: 0,
     should_block_merge: false,
     summary: null,
@@ -150,33 +213,13 @@ async function createOrUpdateReview(
   return data;
 }
 
-export async function queuePullRequestReview(
-  payload: PullRequestWebhookPayload,
-  existingReviewId?: string
-): Promise<QueuePullRequestReviewResult> {
+export async function processPullRequestPayload(payload: PullRequestWebhookPayload, existingReviewId?: string) {
   const parsed = PullRequestPayloadSchema.parse(payload);
   const installationId = parsed.installation?.id;
   if (!installationId) throw new Error("Missing installation ID.");
 
   const supabase = createSupabaseAdminClient();
-  const resolvedUserId = await resolveUserIdForInstallationRepository(
-    supabase,
-    installationId,
-    parsed.repository.id,
-    parsed.repository.full_name
-  );
-  const { repository, userId } = await upsertLinkedRepository(supabase, {
-    userId: resolvedUserId,
-    installationId,
-    githubRepoId: parsed.repository.id,
-    owner: parsed.repository.owner.login,
-    name: parsed.repository.name,
-    fullName: parsed.repository.full_name,
-    private: parsed.repository.private,
-    defaultBranch: parsed.repository.default_branch || null,
-    htmlUrl: parsed.repository.html_url
-  });
-
+  const userId = await resolveInstallationUserId(supabase, installationId, parsed.repository.id, parsed.repository.full_name);
   const userLinkWarning = userId
     ? null
     : "GitHub installation is not linked to a Supabase user; dashboard visibility may be limited.";
@@ -186,38 +229,15 @@ export async function queuePullRequestReview(
     return { ignored: true, reason: "Draft pull request reviews are disabled." };
   }
 
+  const repository = await upsertRepository(supabase, parsed, installationId, userId);
   if (repository.is_active === false) {
     return { ignored: true, reason: "Repository is inactive." };
   }
 
   const review = await createOrUpdateReview(supabase, parsed, repository.id, userId, userLinkWarning, existingReviewId);
 
-  return {
-    ignored: false,
-    reviewId: review.id,
-    job: {
-      payload: parsed,
-      reviewId: review.id,
-      repositoryId: repository.id,
-      installationId,
-      settings
-    }
-  };
-}
-
-export async function processPullRequestReviewInBackground(job: PullRequestReviewJob) {
-  const parsed = job.payload;
-  const supabase = createSupabaseAdminClient();
-
   try {
-    await supabase
-      .from("pull_request_reviews")
-      .update({
-        status: "analyzing"
-      })
-      .eq("id", job.reviewId);
-
-    const octokit = await getInstallationOctokit(job.installationId);
+    const octokit = await getInstallationOctokit(installationId);
     const prepared = await fetchAndPreparePullRequestFiles(octokit, {
       owner: parsed.repository.owner.login,
       repo: parsed.repository.name,
@@ -237,14 +257,14 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
         files: prepared.files,
         largeDiffLimited: prepared.largeDiffLimited
       },
-      job.settings.block_merge_threshold || 70
+      settings.block_merge_threshold || 70
     );
 
     const { data: insertedFindings, error: findingsError } = await supabase
       .from("review_findings")
       .insert(
         aiReview.findings.map((finding) => ({
-          review_id: job.reviewId,
+          review_id: review.id,
           severity: finding.severity,
           category: finding.category,
           title: finding.title,
@@ -272,11 +292,11 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
         files_analyzed: prepared.files.length,
         completed_at: completedAt
       })
-      .eq("id", job.reviewId);
+      .eq("id", review.id);
 
     if (reviewError) throw reviewError;
 
-    await supabase.from("repositories").update({ last_reviewed_at: completedAt }).eq("id", job.repositoryId);
+    await supabase.from("repositories").update({ last_reviewed_at: completedAt }).eq("id", repository.id);
 
     try {
       const commentResult = await postReviewComments(octokit, {
@@ -284,14 +304,14 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
         repo: parsed.repository.name,
         pullNumber: parsed.pull_request.number,
         commitSha: parsed.pull_request.head.sha,
-        reviewId: job.reviewId,
-        reviewUrl: parsed.pull_request.html_url,
+        reviewId: review.id,
+        reviewUrl: review.pr_url,
         summary: aiReview.summary,
         riskScore: aiReview.riskScore,
         shouldBlockMerge: aiReview.shouldBlockMerge,
         findings: insertedFindings || [],
         largeDiffLimited: prepared.largeDiffLimited,
-        settings: job.settings
+        settings
       });
 
       for (const comment of commentResult.inlineComments) {
@@ -315,7 +335,7 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
               .slice(0, 5)
               .join(" | ")}`
           })
-          .eq("id", job.reviewId);
+          .eq("id", review.id);
       }
     } catch (error) {
       await supabase
@@ -326,8 +346,10 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
             "GitHub comment posting failed."
           )}`
         })
-        .eq("id", job.reviewId);
+        .eq("id", review.id);
     }
+
+    return { ignored: false, reviewId: review.id };
   } catch (error) {
     const message = safeErrorMessage(error, "Review processing failed.");
     await supabase
@@ -337,22 +359,12 @@ export async function processPullRequestReviewInBackground(job: PullRequestRevie
         error_message: message,
         completed_at: new Date().toISOString()
       })
-      .eq("id", job.reviewId);
+      .eq("id", review.id);
     throw error;
   }
 }
 
-export async function processPullRequestPayload(payload: PullRequestWebhookPayload, existingReviewId?: string) {
-  const queued = await queuePullRequestReview(payload, existingReviewId);
-  if (queued.ignored || !queued.job) {
-    return { ignored: true, reason: queued.reason };
-  }
-
-  await processPullRequestReviewInBackground(queued.job);
-  return { ignored: false, reviewId: queued.reviewId };
-}
-
-export async function handleGitHubWebhook(rawBody: string, headers: Headers, scheduleReviewJob?: ScheduleReviewJob) {
+export async function handleGitHubWebhook(rawBody: string, headers: Headers) {
   const signature = headers.get("x-hub-signature-256");
   const deliveryId = headers.get("x-github-delivery");
   const eventType = headers.get("x-github-event");
@@ -392,24 +404,9 @@ export async function handleGitHubWebhook(rawBody: string, headers: Headers, sch
   }
 
   try {
-    const result = await queuePullRequestReview(payload);
+    const result = await processPullRequestPayload(payload);
     await supabase.from("webhook_events").update({ processed: true }).eq("github_delivery_id", deliveryId);
-
-    if (result.ignored || !result.job) {
-      return Response.json({ status: "ignored", reason: result.reason });
-    }
-
-    if (scheduleReviewJob) {
-      scheduleReviewJob(result.job);
-    } else {
-      await processPullRequestReviewInBackground(result.job);
-    }
-
-    return Response.json({
-      status: "accepted",
-      reviewId: result.reviewId,
-      message: "Review queued"
-    });
+    return Response.json({ status: "ok", ...result });
   } catch (error) {
     const message = safeErrorMessage(error, "Webhook processing failed.");
     await supabase
